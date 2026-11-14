@@ -3,18 +3,21 @@
 """GLiNER2.5 Decide's DeBERTa encoder and classification head."""
 
 from collections.abc import Iterable, Set
+from functools import cached_property
 
 import torch
 from torch import Tensor, nn
 from transformers import DebertaV2Config
+from transformers.models.deberta_v2.modeling_deberta_v2 import DebertaV2Model
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler.abstract import Pooler
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.model_executor.models.transformers.base import Base
+from vllm.model_executor.models.transformers.deberta import FusedDebertaV2Attention
+from vllm.sequence import IntermediateTensors
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata
-
-from .deberta_v2 import DebertaV2EncoderModel
 
 
 class GLiNER2DecidePooler(Pooler):
@@ -52,38 +55,55 @@ class GLiNER2DecidePooler(Pooler):
         return outputs
 
 
-class Gliner2ForSchemaExtraction(nn.Module):
-    """Serve the English GLiNER2.5 Decide checkpoint for structured decisions.
-
-    The DeBERTa v2 encoder uses vLLM parallel layers and a fused Triton
-    attention kernel on CUDA. Other GLiNER2 extraction heads are not supported.
-    """
-
-    is_pooling_model = True
+class Gliner2ForSchemaExtraction(VllmModelForPooling, Base):
+    """Serve GLiNER2.5 Decide with the Transformers modeling backend."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__()
         config = vllm_config.model_config.hf_config
         if config.architecture != "span" or config.counting_layer != "count_lstm":
             raise ValueError("Only the GLiNER2.5 Decide span checkpoint is supported")
-        encoder_config = DebertaV2Config(**config.encoder_config)
+        if (
+            vllm_config.parallel_config.tensor_parallel_size != 1
+            or vllm_config.parallel_config.pipeline_parallel_size != 1
+        ):
+            raise ValueError(
+                "GLiNER2.5 Decide requires tensor and pipeline parallel size 1"
+            )
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.pooler = GLiNER2DecidePooler(self.model.config.hidden_size)
+        self.pad_token_id = self.model.config.pad_token_id or 0
+
+    @cached_property
+    def _from_config_kwargs(self) -> dict:
+        encoder_config = DebertaV2Config(**self.config.encoder_config)
         encoder_config.hidden_dropout_prob = 0.0
         encoder_config.attention_probs_dropout_prob = 0.0
-        encoder_prefix = f"{prefix}.encoder" if prefix else "encoder"
-        self.encoder = DebertaV2EncoderModel(encoder_config, prefix=encoder_prefix)
-        self.pooler = GLiNER2DecidePooler(encoder_config.hidden_size)
-        self.pad_token_id = encoder_config.pad_token_id or 0
+        return {"config": encoder_config, "dtype": self.model_config.dtype}
 
-    def embed_input_ids(self, input_ids: Tensor) -> Tensor:
-        return self.encoder.embeddings.word_embeddings(input_ids)
+    def _decorate_for_torch_compile(self) -> None:
+        # DeBERTa's embedding mask specializes the padded sequence length.
+        return
+
+    def _create_model(self) -> DebertaV2Model:
+        model = super()._create_model()
+        if not isinstance(model, DebertaV2Model):
+            raise TypeError("Expected Transformers' DebertaV2Model")
+        for layer in model.encoder.layer:
+            layer.attention.self.__class__ = FusedDebertaV2Attention
+        return model
 
     def forward(
         self,
-        input_ids: Tensor,
+        input_ids: Tensor | None,
         positions: Tensor,
-        intermediate_tensors=None,
-        inputs_embeds=None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: Tensor | None = None,
+        **kwargs,
     ) -> Tensor:
+        if input_ids is None or inputs_embeds is not None:
+            raise ValueError(
+                "GLiNER2.5 Decide requires input_ids without inputs_embeds"
+            )
         flat = input_ids.flatten()
         pos = positions.flatten()
         # Positions restart at zero for each sequence; the runner can append
@@ -92,7 +112,7 @@ class Gliner2ForSchemaExtraction(nn.Module):
         real = int(nonzero[-1]) + 1 if nonzero.numel() else flat.numel()
         starts = (pos[:real] == 0).nonzero().flatten().tolist()
         if len(starts) == 1:
-            packed = self.encoder(input_ids=flat[:real][None])[0]
+            packed = self.model(input_ids=flat[:real][None], return_dict=False)[0][0]
         else:
             lengths = [b - a for a, b in zip(starts, [*starts[1:], real])]
             rows = (pos[:real] == 0).cumsum(0) - 1
@@ -101,27 +121,24 @@ class Gliner2ForSchemaExtraction(nn.Module):
             ids[rows, cols] = flat[:real]
             mask = torch.zeros_like(ids)
             mask[rows, cols] = 1
-            hidden = self.encoder(input_ids=ids, attention_mask=mask)
+            hidden = self.model(input_ids=ids, attention_mask=mask, return_dict=False)[
+                0
+            ]
             packed = hidden[rows, cols]
         if packed.shape[0] == flat.shape[0]:
             return packed
         return nn.functional.pad(packed, (0, 0, 0, flat.shape[0] - packed.shape[0]))
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> set[str]:
-        params = dict(self.named_parameters())
-        loaded = set()
-        for name, tensor in weights:
-            if name.startswith("classifier."):
-                name = "pooler." + name
-            param = params.get(name)
-            if param is None:
-                continue  # Span/count extraction heads are unused by Decide.
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if param.shape != tensor.shape and weight_loader is default_weight_loader:
-                raise ValueError(f"GLiNER2 weight shape mismatch for {name}")
-            weight_loader(param, tensor)
-            loaded.add(name)
-        missing = params.keys() - loaded
+        def used_weights():
+            for name, tensor in weights:
+                if name.startswith("encoder."):
+                    yield name.removeprefix("encoder."), tensor
+                elif name.startswith("classifier."):
+                    yield f"pooler.{name}", tensor
+
+        loaded = super().load_weights(used_weights())
+        missing = set(dict(self.named_parameters())) - loaded
         if missing:
             raise ValueError(f"Missing GLiNER2 Decide weights: {sorted(missing)}")
         return loaded

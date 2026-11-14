@@ -10,13 +10,11 @@ import hashlib
 import json
 import math
 import random
-import sys
 import time
-import unicodedata
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import cached_property, lru_cache, partial
+from functools import cached_property, partial
 from typing import Any, ClassVar, TypeVar
 
 import numpy as np
@@ -1452,28 +1450,18 @@ class D3Strategy(ReadStrategy):
 class GLiNER2DecideStrategy(ReadStrategy):
     task: ClassVar[SupportedTask] = "classify"
 
-    @staticmethod
-    @lru_cache(maxsize=1)
-    def _word_pattern() -> re.Pattern[str]:
-        marks = "".join(
-            chr(code)
-            for code in range(sys.maxunicode + 1)
-            if unicodedata.category(chr(code)).startswith("M")
-        )
-        word = rf"[\w{marks}\u200c\u200d]"
-        return re.compile(
-            rf"https?://[^\s]+|www\.[^\s]+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{{2,}}"
-            rf"|@[a-z0-9_]+|{word}+(?:[-_]{word}+)*|\S",
-            re.IGNORECASE,
-        )
-
     def __init__(self, context: ReadContext):
         super().__init__(context)
         tokenizer = context.online_renderer.renderer.get_tokenizer()
         if not isinstance(tokenizer, HfTokenizer):
             raise ValueError("GLiNER2.5 Decide requires a Hugging Face tokenizer")
         self.tokenizer = tokenizer
-        self.words = self._word_pattern()
+        word = r"[\w\p{M}\u200c\u200d]"
+        self.words = re.compile(
+            rf"https?://[^\s]+|www\.[^\s]+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{{2,}}"
+            rf"|@[a-z0-9_]+|{word}+(?:[-_]{word}+)*|\S",
+            re.IGNORECASE,
+        )
 
     def _encode_questions(
         self,
@@ -1491,17 +1479,9 @@ class GLiNER2DecideStrategy(ReadStrategy):
                 part for part in (instructions, question.instructions) if part
             )
             header = f"{question.id}: {prompt}" if prompt else question.id
-            descriptions = {
-                option.name: option.description
-                for option in question.options
-                if option.description is not None
-            }
-            if descriptions:
-                for option in question.options:
-                    if option.name in descriptions:
-                        header += (
-                            f" [DESCRIPTION] {option.name}: {descriptions[option.name]}"
-                        )
+            for option in question.options:
+                if option.description is not None:
+                    header += f" [DESCRIPTION] {option.name}: {option.description}"
             tokens.extend(["(", "[P]", header, "("])
             positions = []
             for option in question.options:

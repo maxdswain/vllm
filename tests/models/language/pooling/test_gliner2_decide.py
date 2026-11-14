@@ -3,14 +3,15 @@
 """Regression coverage for the GLiNER2.5 Decide classification path."""
 
 import pytest
+import requests
 import torch
 from transformers import DebertaV2Config, DebertaV2Model
 
-from vllm.config import ModelConfig, VllmConfig
+from tests.utils import RemoteOpenAIServer
+from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.deberta_v2 import DebertaV2EncoderModel
 from vllm.model_executor.models.gliner2 import Gliner2ForSchemaExtraction
+from vllm.model_executor.models.transformers.deberta import FusedDebertaV2Attention
 from vllm.pooling_params import PoolingParams
 from vllm.transformers_utils.configs.gliner2 import GLiNER2Config
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -38,9 +39,9 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path, dist_
     )
     config.save_pretrained(tmp_path)
     model_config = ModelConfig(model=str(tmp_path), dtype="float32", runner="pooling")
-    model = Gliner2ForSchemaExtraction(
-        vllm_config=VllmConfig(model_config=model_config)
-    )
+    vllm_config = VllmConfig(model_config=model_config)
+    with set_current_vllm_config(vllm_config):
+        model = Gliner2ForSchemaExtraction(vllm_config=vllm_config)
     for param in model.parameters():
         torch.nn.init.normal_(param, std=0.02)
     process_weights_after_loading(model, model_config, torch.device("cpu"))
@@ -55,7 +56,10 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path, dist_
     with torch.no_grad():
         hidden = model(input_ids=ids, positions=positions)
         expected = torch.cat(
-            [model.encoder(input_ids=row[None])[0] for row in (first, second)]
+            [
+                model.model(input_ids=row[None], return_dict=False)[0][0]
+                for row in (first, second)
+            ]
         )
     torch.testing.assert_close(hidden[:9], expected)
     assert torch.count_nonzero(hidden[9]) == 0
@@ -101,9 +105,8 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path, dist_
 
 
 @pytest.mark.parametrize("conv_kernel_size", [0, 3])
-@pytest.mark.parametrize("use_flash_kernel", [True, False])
-def test_native_deberta_relative_attention_matches_transformers_on_cpu(
-    dist_init, conv_kernel_size, use_flash_kernel
+def test_backend_deberta_relative_attention_matches_transformers_on_cpu(
+    tmp_path, dist_init, conv_kernel_size
 ):
     config = DebertaV2Config(
         vocab_size=32,
@@ -123,25 +126,75 @@ def test_native_deberta_relative_attention_matches_transformers_on_cpu(
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
     )
+    gliner_config = GLiNER2Config(
+        encoder_config=config.to_dict(),
+        architectures=["Gliner2ForSchemaExtraction"],
+        architecture="span",
+        counting_layer="count_lstm",
+    )
+    gliner_config.save_pretrained(tmp_path)
+    model_config = ModelConfig(model=str(tmp_path), dtype="float32", runner="pooling")
+    vllm_config = VllmConfig(model_config=model_config)
+    with set_current_vllm_config(vllm_config):
+        model = Gliner2ForSchemaExtraction(vllm_config=vllm_config).eval()
+    for param in model.model.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    assert all(
+        isinstance(layer.attention.self, FusedDebertaV2Attention)
+        for layer in model.model.encoder.layer
+    )
     reference = DebertaV2Model(config).eval()
-    model = DebertaV2EncoderModel(config).eval()
-    params = dict(model.named_parameters())
-    for name, weight in reference.named_parameters():
-        param = params[name]
-        getattr(param, "weight_loader", default_weight_loader)(param, weight)
-    for module in model.modules():
-        if hasattr(module, "quant_method"):
-            module.quant_method.process_weights_after_loading(module)
-    for layer in model.encoder.layer:
-        layer.attention.self.use_flash_kernel = use_flash_kernel
+    weights = model.model.state_dict()
+    weights["embeddings.word_embeddings.weight"] = weights[
+        "embeddings.word_embeddings.weight"
+    ][: config.vocab_size]
+    reference.load_state_dict(weights)
+    process_weights_after_loading(model, model_config, torch.device("cpu"))
 
     ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]])
     valid = ids.ne(0)
     mask = valid.long()
     with torch.no_grad():
-        actual = model(input_ids=ids, attention_mask=mask)
+        actual = model.model(input_ids=ids, attention_mask=mask).last_hidden_state
         expected = reference(input_ids=ids, attention_mask=mask).last_hidden_state
     torch.testing.assert_close(actual[valid], expected[valid], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_transformers_deberta_matches_reference_on_gpu(dtype):
+    if dtype == torch.bfloat16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("bfloat16 requires Ampere or newer")
+    config = DebertaV2Config(
+        vocab_size=32,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type=["p2c", "c2p"],
+        position_buckets=8,
+        norm_rel_ebd="layer_norm",
+        share_att_key=True,
+        position_biased_input=False,
+        type_vocab_size=0,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    reference = DebertaV2Model(config).to(device="cuda", dtype=dtype).eval()
+    model = DebertaV2Model(config).to(device="cuda", dtype=dtype).eval()
+    model.load_state_dict(reference.state_dict())
+    for layer in model.encoder.layer:
+        layer.attention.self.__class__ = FusedDebertaV2Attention
+
+    ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]], device="cuda")
+    valid = ids.ne(0)
+    with torch.inference_mode():
+        actual = model(input_ids=ids, attention_mask=valid).last_hidden_state
+        expected = reference(input_ids=ids, attention_mask=valid).last_hidden_state
+    atol = 3e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(actual[valid], expected[valid], atol=atol, rtol=atol)
 
 
 def test_decide_scores_a_real_checkpoint(vllm_runner):
@@ -185,3 +238,50 @@ def test_decide_scores_a_real_checkpoint(vllm_runner):
     logits = torch.tensor(output.outputs.probs)
     assert logits.shape == (2,)
     assert logits[0] > logits[1]
+
+
+def test_decide_serves_both_endpoints_with_default_flags():
+    """Default serving must load the checkpoint and score request-specific labels."""
+    model = "fastino/GLiNER2.5-Decide"
+    state = "Please cancel my subscription."
+    question = {"type": "choice", "instructions": "What does the customer want?"}
+    with RemoteOpenAIServer(model, []) as server:
+        for endpoint, payload in (
+            (
+                "decisions",
+                {
+                    "input": state,
+                    "questions": [
+                        {
+                            **question,
+                            "name": "intent",
+                            "choices": [{"value": "cancel"}, {"value": "refund"}],
+                        }
+                    ],
+                },
+            ),
+            (
+                "systemone",
+                {
+                    "state": state,
+                    "questions": {
+                        "intent": {
+                            **question,
+                            "criteria": {"cancel": None, "refund": None},
+                        }
+                    },
+                },
+            ),
+        ):
+            response = requests.post(
+                server.url_for(f"v1/{endpoint}"),
+                json={"model": model, **payload},
+                timeout=120,
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            answer = body["answers"][0 if endpoint == "decisions" else "intent"]
+            assert answer["choice"] == "cancel"
+            assert 0 <= answer["confidence"] <= 1
+            assert body["usage"]["input_tokens"] > 0
+            assert body["usage"]["output_tokens"] == 0

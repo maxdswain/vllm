@@ -375,23 +375,25 @@ vllm serve vllm-sr/d3
 ### GLiNER2.5 Decide
 
 [GLiNER2.5 Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) uses a
-native bidirectional DeBERTa-v2 encoder and a classification head to score all
-questions in one forward pass. CUDA uses fused relative-position attention;
-CPU uses PyTorch attention. vLLM serves the English checkpoint as a pooling model.
+bidirectional DeBERTa-v2 encoder and a classification head to score all questions
+in one forward pass. The Transformers modeling backend uses fused relative-position
+attention on CUDA and Transformers attention on CPU. vLLM serves the English
+checkpoint as a pooling model.
 
 ```bash
 vllm serve fastino/GLiNER2.5-Decide
 ```
 
-Send requests to `/v1/systemone` or `/v1/decisions` using `state` and
-`questions`, as in the examples above. `choice`, `noul` and `score` questions
-are supported.
+Send `state` and `questions` to `/v1/systemone`, or `input` and `questions`
+to `/v1/decisions`, as in the examples above. `choice`, `noul` and `score`
+questions are supported.
 
 - Questions and their options precede the state in the prompt. `instructions`
   are included; JSON states are written as JSON text.
 - Each request performs one pooling read. `usage.input_tokens` counts the
   prompt once, `output_tokens` is 0, and `label_mass` is 1.
 - Prefix caching and chunked prefill are off for this bidirectional model.
+- Tensor and pipeline parallelism require size 1.
 
 ### Liquid d1
 
