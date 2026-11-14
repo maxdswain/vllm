@@ -375,8 +375,9 @@ vllm serve vllm-sr/d3
 ### GLiNER2.5 Decide
 
 [GLiNER2.5 Decide](https://huggingface.co/fastino/GLiNER2.5-Decide) uses a
-bidirectional DeBERTa encoder and a classification head to score all questions
-in one forward pass. vLLM serves the English checkpoint as a pooling model.
+native bidirectional DeBERTa-v2 encoder and a classification head to score all
+questions in one forward pass. CUDA uses fused relative-position attention;
+CPU uses PyTorch attention. vLLM serves the English checkpoint as a pooling model.
 
 ```bash
 vllm serve fastino/GLiNER2.5-Decide

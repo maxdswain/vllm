@@ -6,12 +6,15 @@ from collections.abc import Iterable, Set
 
 import torch
 from torch import Tensor, nn
-from transformers import DebertaV2Config, DebertaV2Model
+from transformers import DebertaV2Config
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.pooler.abstract import Pooler
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.tasks import PoolingTask
 from vllm.v1.pool.metadata import PoolingMetadata
+
+from .deberta_v2 import DebertaV2EncoderModel
 
 
 class GLiNER2DecidePooler(Pooler):
@@ -52,9 +55,8 @@ class GLiNER2DecidePooler(Pooler):
 class Gliner2ForSchemaExtraction(nn.Module):
     """Serve the English GLiNER2.5 Decide checkpoint for structured decisions.
 
-    This uses Transformers' DeBERTa v2 implementation, which works on CPU and
-    does not depend on custom CUDA kernels. Other GLiNER2 extraction heads are
-    intentionally not supported.
+    The DeBERTa v2 encoder uses vLLM parallel layers and a fused Triton
+    attention kernel on CUDA. Other GLiNER2 extraction heads are not supported.
     """
 
     is_pooling_model = True
@@ -67,7 +69,8 @@ class Gliner2ForSchemaExtraction(nn.Module):
         encoder_config = DebertaV2Config(**config.encoder_config)
         encoder_config.hidden_dropout_prob = 0.0
         encoder_config.attention_probs_dropout_prob = 0.0
-        self.encoder = DebertaV2Model(encoder_config)
+        encoder_prefix = f"{prefix}.encoder" if prefix else "encoder"
+        self.encoder = DebertaV2EncoderModel(encoder_config, prefix=encoder_prefix)
         self.pooler = GLiNER2DecidePooler(encoder_config.hidden_size)
         self.pad_token_id = encoder_config.pad_token_id or 0
 
@@ -89,7 +92,7 @@ class Gliner2ForSchemaExtraction(nn.Module):
         real = int(nonzero[-1]) + 1 if nonzero.numel() else flat.numel()
         starts = (pos[:real] == 0).nonzero().flatten().tolist()
         if len(starts) == 1:
-            packed = self.encoder(input_ids=flat[:real][None], return_dict=False)[0][0]
+            packed = self.encoder(input_ids=flat[:real][None])[0]
         else:
             lengths = [b - a for a, b in zip(starts, [*starts[1:], real])]
             rows = (pos[:real] == 0).cumsum(0) - 1
@@ -98,9 +101,7 @@ class Gliner2ForSchemaExtraction(nn.Module):
             ids[rows, cols] = flat[:real]
             mask = torch.zeros_like(ids)
             mask[rows, cols] = 1
-            hidden = self.encoder(
-                input_ids=ids, attention_mask=mask, return_dict=False
-            )[0]
+            hidden = self.encoder(input_ids=ids, attention_mask=mask)
             packed = hidden[rows, cols]
         if packed.shape[0] == flat.shape[0]:
             return packed
@@ -115,9 +116,10 @@ class Gliner2ForSchemaExtraction(nn.Module):
             param = params.get(name)
             if param is None:
                 continue  # Span/count extraction heads are unused by Decide.
-            if param.shape != tensor.shape:
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if param.shape != tensor.shape and weight_loader is default_weight_loader:
                 raise ValueError(f"GLiNER2 weight shape mismatch for {name}")
-            param.data.copy_(tensor)
+            weight_loader(param, tensor)
             loaded.add(name)
         missing = params.keys() - loaded
         if missing:

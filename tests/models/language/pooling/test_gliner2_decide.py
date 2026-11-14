@@ -4,9 +4,12 @@
 
 import pytest
 import torch
-from transformers import DebertaV2Config
+from transformers import DebertaV2Config, DebertaV2Model
 
 from vllm.config import ModelConfig, VllmConfig
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.deberta_v2 import DebertaV2EncoderModel
 from vllm.model_executor.models.gliner2 import Gliner2ForSchemaExtraction
 from vllm.pooling_params import PoolingParams
 from vllm.transformers_utils.configs.gliner2 import GLiNER2Config
@@ -15,7 +18,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 pytestmark = pytest.mark.core_model
 
 
-def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path):
+def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path, dist_init):
     encoder_config = DebertaV2Config(
         vocab_size=32,
         hidden_size=16,
@@ -38,6 +41,9 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path):
     model = Gliner2ForSchemaExtraction(
         vllm_config=VllmConfig(model_config=model_config)
     )
+    for param in model.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    process_weights_after_loading(model, model_config, torch.device("cpu"))
     model.eval()
     assert model.pooler.get_supported_tasks() == {"classify"}
 
@@ -49,10 +55,7 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path):
     with torch.no_grad():
         hidden = model(input_ids=ids, positions=positions)
         expected = torch.cat(
-            [
-                model.encoder(input_ids=row[None]).last_hidden_state[0]
-                for row in (first, second)
-            ]
+            [model.encoder(input_ids=row[None])[0] for row in (first, second)]
         )
     torch.testing.assert_close(hidden[:9], expected)
     assert torch.count_nonzero(hidden[9]) == 0
@@ -95,6 +98,50 @@ def test_decide_cpu_batch_keeps_bidirectional_sequences_separate(tmp_path):
     torch.testing.assert_close(
         scored, model.pooler.classifier(expected[5:][[0, 2]]).flatten()
     )
+
+
+@pytest.mark.parametrize("conv_kernel_size", [0, 3])
+@pytest.mark.parametrize("use_flash_kernel", [True, False])
+def test_native_deberta_relative_attention_matches_transformers_on_cpu(
+    dist_init, conv_kernel_size, use_flash_kernel
+):
+    config = DebertaV2Config(
+        vocab_size=32,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        max_position_embeddings=32,
+        relative_attention=True,
+        pos_att_type=["p2c", "c2p"],
+        position_buckets=8,
+        norm_rel_ebd="layer_norm",
+        share_att_key=True,
+        position_biased_input=False,
+        type_vocab_size=0,
+        conv_kernel_size=conv_kernel_size,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+    )
+    reference = DebertaV2Model(config).eval()
+    model = DebertaV2EncoderModel(config).eval()
+    params = dict(model.named_parameters())
+    for name, weight in reference.named_parameters():
+        param = params[name]
+        getattr(param, "weight_loader", default_weight_loader)(param, weight)
+    for module in model.modules():
+        if hasattr(module, "quant_method"):
+            module.quant_method.process_weights_after_loading(module)
+    for layer in model.encoder.layer:
+        layer.attention.self.use_flash_kernel = use_flash_kernel
+
+    ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]])
+    valid = ids.ne(0)
+    mask = valid.long()
+    with torch.no_grad():
+        actual = model(input_ids=ids, attention_mask=mask)
+        expected = reference(input_ids=ids, attention_mask=mask).last_hidden_state
+    torch.testing.assert_close(actual[valid], expected[valid], atol=1e-5, rtol=1e-5)
 
 
 def test_decide_scores_a_real_checkpoint(vllm_runner):
